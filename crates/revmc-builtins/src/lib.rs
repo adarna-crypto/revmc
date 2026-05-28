@@ -108,14 +108,26 @@ macro_rules! builtins {
 
 builtins! {
 
+// Both builtins below exist precisely to raise a Rust panic from JIT'd
+// machine code, so the ABI must be `extern "C-unwind"` rather than
+// `extern "C"` — otherwise the panic crosses an FFI boundary that rustc
+// flags as nounwind and the process aborts via "panic in a function that
+// cannot unwind" instead of unwinding into the Rust caller's
+// `catch_unwind`. Upstream paradigmxyz/revmc#307 accidentally stripped
+// `-unwind` from both while doing perf work on other builtins. This file
+// is local-only as part of rarbi's `[patch]` override of revmc.
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_panic(data: *const u8, len: usize) -> ! {
+pub unsafe extern "C-unwind" fn __revmc_builtin_panic(data: *const u8, len: usize) -> ! {
     let msg = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(data, len)) };
     panic!("{msg}");
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __revmc_builtin_assert_spec_id(ecx: &EvmContext<'_>, expected: SpecId) {
+pub unsafe extern "C-unwind" fn __revmc_builtin_assert_spec_id(
+    ecx: &EvmContext<'_>,
+    expected: SpecId,
+) {
     assert_eq!(
         ecx.spec_id, expected,
         "revmc panic: runtime spec_id does not match compilation spec_id"
