@@ -426,6 +426,25 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
             // Suspend block: store the `resume_at` value and return `Stop`.
             {
                 fx.bcx.switch_to_block(fx.suspend_block);
+                // Local fork patch: clear the vstack pending-stores tracker
+                // before filling the suspend block. Each suspend SITE (every
+                // CALL/STATICCALL/CREATE) already calls `self.suspend()` →
+                // `self.materialize_live_stack()` in the calling block before
+                // branching here, so the inputs are guaranteed materialized
+                // by the caller. The shared `vstack` field, however, retains
+                // the pending-stores state from whatever instruction was
+                // translated LAST (it's a function-scope mutable). Without
+                // this reset, the `build_return_imm(Stop)` below calls
+                // `materialize_live_stack()` against that stale state and
+                // emits `store <value-from-block-X>, ptr <gep-from-block-Y>`
+                // in the suspend block — broken SSA (use without dominating
+                // def). LLVM's verifier rejects this with "Instruction does
+                // not dominate all uses!"; the non-verifying codegen path
+                // (live JIT, no -O2 llc) crashes the RegisterCoalescer with
+                // a null `LiveRange::Segment*` deref. `reset(0, 0)` makes
+                // `pending_stores` empty so `materialize_live_stack` is a
+                // no-op here.
+                fx.vstack.reset(0, 0);
                 let resume_value = fx.bcx.phi(resume_ty, &fx.suspend_blocks);
                 let resume_at = get_ecx_resume_at_ptr(&mut fx);
                 fx.bcx.store_aligned(resume_value, resume_at, 1);
