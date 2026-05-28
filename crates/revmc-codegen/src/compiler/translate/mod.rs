@@ -394,10 +394,24 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 // (no .eh_frame), so `_Unwind_RaiseException` returns _URC_END_OF_STACK
                 // and the process aborts with "fatal runtime error: failed to initiate
                 // panic, error 5" — bypassing any `catch_unwind` in the rarbi-side
-                // caller. Returning `FatalExternalError` through the normal exit path
-                // instead lets the rarbi caller treat this as a per-transaction error
-                // and keep the agent process alive.
-                fx.build_return_imm(InstructionResult::FatalExternalError);
+                // caller. We return `FatalExternalError` instead.
+                //
+                // CRITICAL: we emit a direct `ret` rather than going through
+                // `build_return_imm` because the latter (when `inspect_stack: true`)
+                // calls `materialize_live_stack()`, which references SSA values
+                // produced by other basic blocks that don't dominate this one
+                // (e.g., the most-recently-translated SWAP / DUP / JUMPDEST block).
+                // That produces broken SSA — LLVM's verifier rejects it with
+                // "Instruction does not dominate all uses!" and the codegen
+                // pipeline's register coalescer reads through a null
+                // `LiveRange::Segment*` and SIGSEGVs. The original `call_panic`
+                // path also did not materialize the stack (it just emitted
+                // `unreachable`) so a direct `ret` preserves that contract.
+                let ret_value = fx.bcx.iconst(
+                    fx.i8_type,
+                    InstructionResult::FatalExternalError as i64,
+                );
+                fx.bcx.ret(&[ret_value]);
 
                 fx.bcx.switch_to_block(resume_block);
                 let targets = fx
