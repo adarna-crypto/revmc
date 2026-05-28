@@ -394,7 +394,16 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 // (no .eh_frame), so `_Unwind_RaiseException` returns _URC_END_OF_STACK
                 // and the process aborts with "fatal runtime error: failed to initiate
                 // panic, error 5" — bypassing any `catch_unwind` in the rarbi-side
-                // caller. We return `FatalExternalError` instead.
+                // caller. We return `Revert` instead.
+                //
+                // We use `Revert` (NOT `FatalExternalError`): revm reserves
+                // `FatalExternalError` for the contract "the Host set ctx.error()
+                // to a DB-layer error and the interpreter is bailing"; downstream
+                // it goes through `revm-handler::frame::insert_call_outcome`
+                // which `panic!()`s on bare FatalExternalError without a matching
+                // `ctx.error()`. `Revert` is the right neutral exit: gets routed
+                // through `Halt(Revert)` / `ExecutionResult::Revert`, marks the
+                // tx as failed at the strategy boundary, no nested panics.
                 //
                 // CRITICAL: we emit a direct `ret` rather than going through
                 // `build_return_imm` because the latter (when `inspect_stack: true`)
@@ -409,7 +418,7 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 // `unreachable`) so a direct `ret` preserves that contract.
                 let ret_value = fx.bcx.iconst(
                     fx.i8_type,
-                    InstructionResult::FatalExternalError as i64,
+                    InstructionResult::Revert as i64,
                 );
                 fx.bcx.ret(&[ret_value]);
 
