@@ -388,7 +388,16 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 fx.copy_stack_from_arg(stack_len);
                 let default = fx.bcx.create_block_after(resume_block, "resume_invalid");
                 fx.bcx.switch_to_block(default);
-                fx.call_panic("invalid `resume_at` value");
+                // Local fork patch: upstream calls `fx.call_panic("invalid resume_at value")`
+                // here, which invokes `__revmc_builtin_panic` and raises a Rust panic.
+                // The panic unwinder cannot walk past the naked `revmc_entry` shim
+                // (no .eh_frame), so `_Unwind_RaiseException` returns _URC_END_OF_STACK
+                // and the process aborts with "fatal runtime error: failed to initiate
+                // panic, error 5" — bypassing any `catch_unwind` in the rarbi-side
+                // caller. Returning `FatalExternalError` through the normal exit path
+                // instead lets the rarbi caller treat this as a per-transaction error
+                // and keep the agent process alive.
+                fx.build_return_imm(InstructionResult::FatalExternalError);
 
                 fx.bcx.switch_to_block(resume_block);
                 let targets = fx
