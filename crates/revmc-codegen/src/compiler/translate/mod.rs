@@ -388,7 +388,18 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 fx.copy_stack_from_arg(stack_len);
                 let default = fx.bcx.create_block_after(resume_block, "resume_invalid");
                 fx.bcx.switch_to_block(default);
-                fx.call_panic("invalid `resume_at` value");
+                // Upstream emits `call_panic` here. A panic raised from JIT'd code
+                // cannot unwind past the naked `revmc_entry` shim (no `.eh_frame`),
+                // so it aborts the whole process ("failed to initiate panic, error
+                // 5") instead of bailing the frame. Return `Revert` directly so an
+                // invalid `resume_at` fails only the transaction and the long-running
+                // host survives. `Revert` (not `FatalExternalError`): revm reserves
+                // the latter for the host-set-`ctx.error()` contract and downstream
+                // `revm-handler` `panic!()`s on a bare `FatalExternalError`. A direct
+                // `ret` (not `build_return_imm`) avoids `materialize_live_stack`,
+                // matching `call_panic`'s no-materialize contract.
+                let ret_value = fx.bcx.iconst(fx.i8_type, InstructionResult::Revert as i64);
+                fx.bcx.ret(&[ret_value]);
 
                 fx.bcx.switch_to_block(resume_block);
                 let targets = fx
