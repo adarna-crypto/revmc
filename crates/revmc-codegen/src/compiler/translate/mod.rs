@@ -494,6 +494,22 @@ impl<'a, B: Backend> FunctionCx<'a, B> {
                 fx.bcx.phi(fx.i8_type, &fx.incoming_failures)
             };
             fx.bcx.set_current_block_cold();
+            // Same hazard as the suspend block above (see the `vstack.reset`
+            // comment there): `build_return` with `inspect_stack` calls
+            // `materialize_live_stack`, which would re-emit the pending stores
+            // held by whatever instruction was translated LAST into this SHARED
+            // block. The gas/stack-overflow checks (`build_check_inner`) and the
+            // invalid-jump site branch here without materializing, and the block
+            // merges sites at differing stack states, so the section GEP
+            // (`section_start_sp`) from the last instruction's section does not
+            // dominate the store — LLVM rejects it with "Instruction does not
+            // dominate all uses" (release builds SIGSEGV in the register
+            // allocator's spill-weight calc). A failure is an EVM halt: the
+            // partial stack is discarded and the failed op never committed its
+            // push, so the flush is meaningless anyway. `reset(0, 0)` makes it a
+            // no-op. (The `build_fail` sites already materialize correctly at the
+            // site before branching here; only this shared re-flush is invalid.)
+            fx.vstack.reset(0, 0);
             fx.build_return(failure_value);
         } else {
             fx.bcx.unreachable();
