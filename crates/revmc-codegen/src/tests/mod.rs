@@ -2326,3 +2326,39 @@ fn bytecode_ternop_mixed(
 fn asm(s: &str) -> Vec<u8> {
     crate::parse_asm(s).unwrap()
 }
+
+/// Regression for adarna-crypto/rarbi#775: a value left on the virtual stack
+/// *below* a SELFDESTRUCT input must not be materialized against a section GEP
+/// that fails to dominate the store. `inspect_stack` forces a full live-stack
+/// flush on the terminating path; the debug LLVM verifier rejects the bad IR
+/// ("Instruction does not dominate all uses"), and a release build SIGSEGVs in
+/// the register allocator. The fix is structural in this rebase: the shared
+/// failure block returns via `build_return_inner` (which bypasses
+/// `materialize_live_stack`), so the flush never happens. This test guards that
+/// the failure/suspend paths stay materialize-free. Requires PRAGUE + gas
+/// metering + inspect_stack + opt.
+#[cfg(feature = "llvm")]
+#[test]
+fn selfdestruct_below_input_dominates_issue_775() {
+    with_jit_compiler(revmc_backend::OptimizationLevel::Less, |compiler| {
+        compiler.gas_metering(true);
+        compiler.inspect_stack(true);
+
+        // Minimal trigger: 0x2f left on the vstack below the consumed beneficiary.
+        let minimal: &[u8] = &[op::PUSH1, 0x2f, op::ADDRESS, op::SELFDESTRUCT];
+        unsafe { compiler.jit("issue_775_min", minimal, SpecId::PRAGUE) }
+            .expect("issue #775: malformed IR for SELFDESTRUCT live-stack flush");
+
+        // The exact deployed contract from the issue (solc 0.8.26, fn b09614d6
+        // doing ADDRESS; SELFDESTRUCT below a PUSH1 0x2f).
+        compiler.clear_ir().unwrap();
+        let deployed = hex::decode(
+            "6080604052348015600e575f80fd5b50600436106026575f3560e01c8063b09614d6\
+             14602a575b5f80fd5b602f30ff5b00fea264697066735822122055232f4602233f77\
+             08ab1ed17276a0408fd66c16ada26cbaf43efc46f77f242b64736f6c634300081a0033",
+        )
+        .unwrap();
+        unsafe { compiler.jit("issue_775_deployed", &deployed, SpecId::PRAGUE) }
+            .expect("issue #775: deployed SELFDESTRUCT contract must compile");
+    });
+}
