@@ -2326,3 +2326,403 @@ fn bytecode_ternop_mixed(
 fn asm(s: &str) -> Vec<u8> {
     crate::parse_asm(s).unwrap()
 }
+
+// ---------------------------------------------------------------------------------------------
+// EIP-2929 cold-access section boundary.
+//
+// The interpreter charges static gas per instruction, so at a cold-access builtin's
+// `skip_cold_load = gas.remaining() < cold_cost` decision it has paid exactly the static gas up
+// to and including the opcode. Compiled code pre-charges a whole gas section at its head, so the
+// section must end at the cold-access opcode; otherwise the builtin observes `gasleft()` reduced
+// by the trailing instructions' static gas and skips the load (never touching the host) where the
+// interpreter loads and only runs out of gas afterwards.
+//
+// Each probe below reaches the cold access with `remaining - base` in the window
+// `[cold_cost, cold_cost + trailing_static_gas)` and then runs out of gas, or sits just below
+// `cold_cost` (both arms must skip), or has plenty of gas (both arms load, identical gas).
+// `assert_host` runs against both the interpreter's host and the compiled function's host, and
+// `modify_host` enables warm/cold tracking on both.
+// ---------------------------------------------------------------------------------------------
+
+/// `OTHER_ADDR` (`Address::repeat_byte(0x69)`) as a `PUSH20` immediate.
+const OTHER_ADDR_BYTES: [u8; 20] = [0x69; 20];
+
+/// `PUSH20 OTHER_ADDR, <op>, POP, PUSH1 1, PUSH1 2, ADD, POP, STOP`.
+const fn cold_account_probe(opcode: u8) -> [u8; 31] {
+    let mut code = [0u8; 31];
+    code[0] = op::PUSH20;
+    let mut i = 0;
+    while i < 20 {
+        code[1 + i] = OTHER_ADDR_BYTES[i];
+        i += 1;
+    }
+    code[21] = opcode;
+    code[22] = op::POP;
+    code[23] = op::PUSH1;
+    code[24] = 1;
+    code[25] = op::PUSH1;
+    code[26] = 2;
+    code[27] = op::ADD;
+    code[28] = op::POP;
+    code[29] = op::STOP;
+    code[30] = op::STOP;
+    code
+}
+
+/// `PUSH20 OTHER_ADDR, <op>, POP, PUSH20 OTHER_ADDR, <op>, STOP` — cold then warm.
+const fn cold_then_warm_account_probe(opcode: u8) -> [u8; 45] {
+    let mut code = [0u8; 45];
+    code[0] = op::PUSH20;
+    code[22] = op::POP;
+    code[23] = op::PUSH20;
+    let mut i = 0;
+    while i < 20 {
+        code[1 + i] = OTHER_ADDR_BYTES[i];
+        code[24 + i] = OTHER_ADDR_BYTES[i];
+        i += 1;
+    }
+    code[21] = opcode;
+    code[44] = opcode;
+    code
+}
+
+const BALANCE_PROBE: [u8; 31] = cold_account_probe(op::BALANCE);
+const EXTCODESIZE_PROBE: [u8; 31] = cold_account_probe(op::EXTCODESIZE);
+const EXTCODEHASH_PROBE: [u8; 31] = cold_account_probe(op::EXTCODEHASH);
+const BALANCE_TWICE: [u8; 45] = cold_then_warm_account_probe(op::BALANCE);
+const EXTCODESIZE_TWICE: [u8; 45] = cold_then_warm_account_probe(op::EXTCODESIZE);
+const EXTCODEHASH_TWICE: [u8; 45] = cold_then_warm_account_probe(op::EXTCODEHASH);
+
+/// `PUSH0 PUSH0 PUSH0 PUSH20 OTHER_ADDR EXTCODECOPY PUSH1 1 PUSH1 2 ADD POP STOP` (len = 0 so
+/// no copy gas and no memory expansion; the account load is the only dynamic part).
+const EXTCODECOPY_PROBE: [u8; 32] = {
+    let mut code = [0u8; 32];
+    code[0] = op::PUSH0;
+    code[1] = op::PUSH0;
+    code[2] = op::PUSH0;
+    code[3] = op::PUSH20;
+    let mut i = 0;
+    while i < 20 {
+        code[4 + i] = OTHER_ADDR_BYTES[i];
+        i += 1;
+    }
+    code[24] = op::EXTCODECOPY;
+    code[25] = op::PUSH1;
+    code[26] = 1;
+    code[27] = op::PUSH1;
+    code[28] = 2;
+    code[29] = op::ADD;
+    code[30] = op::POP;
+    code[31] = op::STOP;
+    code
+};
+
+/// `PUSH1 69, SLOAD, POP, PUSH1 1, PUSH1 2, ADD, POP, STOP` (slot 69 = 42 in `def_storage`).
+const SLOAD_PROBE: &[u8] = &[
+    op::PUSH1,
+    69,
+    op::SLOAD,
+    op::POP,
+    op::PUSH1,
+    1,
+    op::PUSH1,
+    2,
+    op::ADD,
+    op::POP,
+    op::STOP,
+];
+
+/// `PUSH1 69, SLOAD, POP, PUSH1 69, SLOAD, STOP` — cold then warm.
+const SLOAD_TWICE: &[u8] = &[op::PUSH1, 69, op::SLOAD, op::POP, op::PUSH1, 69, op::SLOAD, op::STOP];
+
+/// `PUSH20 OTHER_ADDR, SELFDESTRUCT`.
+const SELFDESTRUCT_PROBE: [u8; 22] = {
+    let mut code = [0u8; 22];
+    code[0] = op::PUSH20;
+    let mut i = 0;
+    while i < 20 {
+        code[1 + i] = OTHER_ADDR_BYTES[i];
+        i += 1;
+    }
+    code[21] = op::SELFDESTRUCT;
+    code
+};
+
+/// Static gas before and including the single-input account probes' cold opcode: PUSH20 (3) +
+/// warm base (100).
+const ACCOUNT_PROBE_PREFIX: u64 = 3 + 100;
+/// Static gas before and including EXTCODECOPY: 3 × PUSH0 (2) + PUSH20 (3) + warm base (100).
+const EXTCODECOPY_PROBE_PREFIX: u64 = 2 + 2 + 2 + 3 + 100;
+/// Static gas before and including SLOAD: PUSH1 (3) + warm base (100).
+const SLOAD_PROBE_PREFIX: u64 = 3 + 100;
+/// Static gas of `POP PUSH1 PUSH1 ADD POP STOP` after the probes' cold opcode.
+const PROBE_TRAILING: u64 = 2 + 3 + 3 + 3 + 2;
+/// Static gas of `PUSH1 PUSH1 ADD POP STOP` after EXTCODECOPY.
+const EXTCODECOPY_TRAILING: u64 = 3 + 3 + 3 + 2;
+
+fn cold_account_cost() -> u64 {
+    context_interface::cfg::GasParams::new_spec(DEF_SPEC).cold_account_additional_cost()
+}
+
+fn cold_slot_cost() -> u64 {
+    context_interface::cfg::GasParams::new_spec(DEF_SPEC).cold_storage_additional_cost()
+}
+
+fn selfdestruct_cold_cost() -> u64 {
+    context_interface::cfg::GasParams::new_spec(DEF_SPEC).selfdestruct_cold_cost()
+}
+
+fn enable_cold_tracking(host: &mut TestHost) {
+    host.enable_cold_tracking();
+}
+
+/// The account was loaded exactly once, with `skip_cold_load = false`, and nothing was skipped.
+fn assert_loaded_other_account(host: &TestHost) {
+    assert_eq!(host.account_accesses, [(OTHER_ADDR, false)]);
+    assert_eq!(host.skipped_cold_loads, []);
+}
+
+/// The account was never loaded: the (only) access was refused as a skipped cold load.
+fn assert_skipped_other_account(host: &TestHost) {
+    assert_eq!(host.account_accesses, []);
+    assert_eq!(host.skipped_cold_loads, [ColdLoadKey::Account(OTHER_ADDR)]);
+}
+
+fn assert_loaded_other_account_twice(host: &TestHost) {
+    assert_eq!(host.account_accesses, [(OTHER_ADDR, false), (OTHER_ADDR, false)]);
+    assert_eq!(host.skipped_cold_loads, []);
+}
+
+fn assert_loaded_slot_69(host: &TestHost) {
+    assert_eq!(host.slot_accesses, [(U256::from(69), false)]);
+    assert_eq!(host.skipped_cold_loads, []);
+}
+
+fn assert_skipped_slot_69(host: &TestHost) {
+    assert_eq!(host.slot_accesses, []);
+    assert_eq!(host.skipped_cold_loads, [ColdLoadKey::Slot(U256::from(69))]);
+}
+
+fn assert_loaded_slot_69_twice(host: &TestHost) {
+    assert_eq!(host.slot_accesses, [(U256::from(69), false), (U256::from(69), false)]);
+    assert_eq!(host.skipped_cold_loads, []);
+}
+
+macro_rules! cold_access_tests {
+    ($(
+        $group:ident {
+            probe: $probe:expr,
+            twice: $twice:expr,
+            prefix: $prefix:expr,
+            trailing: $trailing:expr,
+            cold_cost: $cold_cost:expr,
+            loaded: $loaded:expr,
+            loaded_twice: $loaded_twice:expr,
+            skipped: $skipped:expr,
+            warm_gas: $warm_gas:expr,
+            twice_stack: $twice_stack:expr,
+        }
+    )*) => { uint! { $(
+        mod $group {
+            use super::*;
+            #[allow(unused_imports)]
+            use similar_asserts::assert_eq;
+
+            // Remaining gas after the opcode's base is `cold_cost + 5`, i.e. inside the window
+            // `[cold_cost, cold_cost + trailing)`: the interpreter loads, pays the surcharge
+            // and runs out of gas on the trailing instructions. The compiled arm must load too.
+            matrix_tests!(load_then_oog_inside_window = |jit| run_test_case(
+                &TestCase {
+                    bytecode: $probe,
+                    gas_limit: $prefix + $cold_cost + 5,
+                    modify_host: Some(enable_cold_tracking),
+                    expected_return: InstructionResult::OutOfGas,
+                    expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+                    assert_host: Some($loaded),
+                    ..Default::default()
+                },
+                jit,
+            ));
+
+            // Remaining gas after the base is exactly `cold_cost` (the lower window edge): the
+            // surcharge is still payable, so both arms load and then OOG immediately.
+            matrix_tests!(load_at_exact_cold_cost = |jit| run_test_case(
+                &TestCase {
+                    bytecode: $probe,
+                    gas_limit: $prefix + $cold_cost,
+                    modify_host: Some(enable_cold_tracking),
+                    expected_return: InstructionResult::OutOfGas,
+                    expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+                    assert_host: Some($loaded),
+                    ..Default::default()
+                },
+                jit,
+            ));
+
+            // Remaining gas after the base is `cold_cost + trailing - 1` (upper window edge).
+            matrix_tests!(load_at_window_upper_edge = |jit| run_test_case(
+                &TestCase {
+                    bytecode: $probe,
+                    gas_limit: $prefix + $cold_cost + $trailing - 1,
+                    modify_host: Some(enable_cold_tracking),
+                    expected_return: InstructionResult::OutOfGas,
+                    expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+                    assert_host: Some($loaded),
+                    ..Default::default()
+                },
+                jit,
+            ));
+
+            // Remaining gas after the base is `cold_cost - 1`: the interpreter skips the cold
+            // load and the host is never touched. The compiled arm must skip as well.
+            matrix_tests!(skip_below_cold_cost = |jit| run_test_case(
+                &TestCase {
+                    bytecode: $probe,
+                    gas_limit: $prefix + $cold_cost - 1,
+                    modify_host: Some(enable_cold_tracking),
+                    expected_return: InstructionResult::OutOfGas,
+                    expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+                    assert_host: Some($skipped),
+                    ..Default::default()
+                },
+                jit,
+            ));
+
+            // Plenty of gas: the access is served cold once and warm the second time; result,
+            // stack and total gas must match the interpreter exactly (the extra section
+            // boundary must not change the gas accounting).
+            matrix_tests!(cold_then_warm_completes = |jit| run_test_case(
+                &TestCase {
+                    bytecode: $twice,
+                    modify_host: Some(enable_cold_tracking),
+                    expected_stack: $twice_stack,
+                    expected_gas: $warm_gas,
+                    assert_host: Some($loaded_twice),
+                    ..Default::default()
+                },
+                jit,
+            ));
+        }
+    )* } };
+}
+
+cold_access_tests! {
+    balance_cold_access {
+        probe: &BALANCE_PROBE,
+        twice: &BALANCE_TWICE,
+        prefix: ACCOUNT_PROBE_PREFIX,
+        trailing: PROBE_TRAILING,
+        cold_cost: cold_account_cost(),
+        loaded: assert_loaded_other_account,
+        loaded_twice: assert_loaded_other_account_twice,
+        skipped: assert_skipped_other_account,
+        warm_gas: 3 + 100 + cold_account_cost() + 2 + 3 + 100,
+        twice_stack: &[0x69_U256],
+    }
+    extcodesize_cold_access {
+        probe: &EXTCODESIZE_PROBE,
+        twice: &EXTCODESIZE_TWICE,
+        prefix: ACCOUNT_PROBE_PREFIX,
+        trailing: PROBE_TRAILING,
+        cold_cost: cold_account_cost(),
+        loaded: assert_loaded_other_account,
+        loaded_twice: assert_loaded_other_account_twice,
+        skipped: assert_skipped_other_account,
+        warm_gas: 3 + 100 + cold_account_cost() + 2 + 3 + 100,
+        twice_stack: &[U256::from(def_codemap()[&OTHER_ADDR].len())],
+    }
+    extcodehash_cold_access {
+        probe: &EXTCODEHASH_PROBE,
+        twice: &EXTCODEHASH_TWICE,
+        prefix: ACCOUNT_PROBE_PREFIX,
+        trailing: PROBE_TRAILING,
+        cold_cost: cold_account_cost(),
+        loaded: assert_loaded_other_account,
+        loaded_twice: assert_loaded_other_account_twice,
+        skipped: assert_skipped_other_account,
+        warm_gas: 3 + 100 + cold_account_cost() + 2 + 3 + 100,
+        twice_stack: &[def_codemap()[&OTHER_ADDR].hash_slow().into()],
+    }
+    sload_cold_access {
+        probe: SLOAD_PROBE,
+        twice: SLOAD_TWICE,
+        prefix: SLOAD_PROBE_PREFIX,
+        trailing: PROBE_TRAILING,
+        cold_cost: cold_slot_cost(),
+        loaded: assert_loaded_slot_69,
+        loaded_twice: assert_loaded_slot_69_twice,
+        skipped: assert_skipped_slot_69,
+        warm_gas: 3 + 100 + cold_slot_cost() + 2 + 3 + 100,
+        twice_stack: &[42_U256],
+    }
+}
+
+tests! {
+    extcodecopy_cold_access {
+        // Inside the window: interpreter loads, pays the surcharge, then OOGs on the trailing
+        // instructions; the compiled arm must load as well.
+        load_then_oog_inside_window(@raw {
+            bytecode: &EXTCODECOPY_PROBE,
+            gas_limit: EXTCODECOPY_PROBE_PREFIX + cold_account_cost() + 5,
+            modify_host: Some(enable_cold_tracking),
+            expected_return: InstructionResult::OutOfGas,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+            assert_host: Some(assert_loaded_other_account),
+        }),
+        load_at_window_upper_edge(@raw {
+            bytecode: &EXTCODECOPY_PROBE,
+            gas_limit: EXTCODECOPY_PROBE_PREFIX + cold_account_cost() + EXTCODECOPY_TRAILING - 1,
+            modify_host: Some(enable_cold_tracking),
+            expected_return: InstructionResult::OutOfGas,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+            assert_host: Some(assert_loaded_other_account),
+        }),
+        skip_below_cold_cost(@raw {
+            bytecode: &EXTCODECOPY_PROBE,
+            gas_limit: EXTCODECOPY_PROBE_PREFIX + cold_account_cost() - 1,
+            modify_host: Some(enable_cold_tracking),
+            expected_return: InstructionResult::OutOfGas,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+            assert_host: Some(assert_skipped_other_account),
+        }),
+        cold_completes(@raw {
+            bytecode: &EXTCODECOPY_PROBE,
+            modify_host: Some(enable_cold_tracking),
+            expected_gas: EXTCODECOPY_PROBE_PREFIX + cold_account_cost() + EXTCODECOPY_TRAILING,
+            assert_host: Some(assert_loaded_other_account),
+        }),
+    }
+
+    selfdestruct_cold_access {
+        // SELFDESTRUCT already ends its section (it is diverging); this pins the same
+        // skip-cold-load parity for it. Remaining gas after the 5000 base is exactly the
+        // selfdestruct cold cost: the target is loaded and charged on both arms.
+        load_at_exact_cold_cost(@raw {
+            bytecode: &SELFDESTRUCT_PROBE,
+            gas_limit: 3 + 5000 + selfdestruct_cold_cost(),
+            modify_host: Some(enable_cold_tracking),
+            expected_return: InstructionResult::SelfDestruct,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+            assert_host: Some(|host| {
+                assert_loaded_other_account(host);
+                assert_eq!(host.selfdestructs, [(DEF_ADDR, OTHER_ADDR)]);
+            }),
+        }),
+        skip_below_cold_cost(@raw {
+            bytecode: &SELFDESTRUCT_PROBE,
+            gas_limit: 3 + 5000 + selfdestruct_cold_cost() - 1,
+            modify_host: Some(enable_cold_tracking),
+            expected_return: InstructionResult::OutOfGas,
+            expected_gas: GAS_WHAT_INTERPRETER_SAYS,
+            assert_host: Some(|host| {
+                assert_skipped_other_account(host);
+                assert_eq!(host.selfdestructs, []);
+            }),
+        }),
+    }
+}
+
+#[test]
+fn other_addr_bytes_match_other_addr() {
+    assert_eq!(Address::from(OTHER_ADDR_BYTES), OTHER_ADDR);
+}

@@ -11,7 +11,7 @@ use revm_interpreter::{
     instructions::{gas_table_spec, instruction_table},
     interpreter::ExtBytecode,
 };
-use revm_primitives::{B256, HashMap, Log, hardfork::SpecId};
+use revm_primitives::{B256, HashMap, HashSet, Log, hardfork::SpecId};
 use similar_asserts::assert_eq;
 use std::{fmt, path::Path, sync::OnceLock};
 
@@ -96,6 +96,9 @@ pub struct TestCase<'a> {
     /// Override `inspect_stack` on the compiler. `None` uses the default (`true`).
     pub inspect_stack: Option<bool>,
     pub modify_ecx: Option<fn(&mut EvmContext<'_>)>,
+    /// Applied to *both* the interpreter's and the compiled function's [`TestHost`] before the
+    /// run, so host behavior (e.g. [`TestHost::cold_tracking`]) is identical on both arms.
+    pub modify_host: Option<fn(&mut TestHost)>,
 
     pub expected_return: InstructionResult,
     pub expected_stack: &'a [U256],
@@ -127,6 +130,7 @@ impl Default for TestCase<'_> {
             gas_limit: DEF_GAS_LIMIT,
             inspect_stack: None,
             modify_ecx: None,
+            modify_host: None,
             expected_return: InstructionResult::Stop,
             expected_stack: &[],
             expected_memory: &[],
@@ -145,6 +149,7 @@ impl fmt::Debug for TestCase<'_> {
             .field("spec_id", &self.spec_id)
             .field("inspect_stack", &self.inspect_stack)
             .field("modify_ecx", &self.modify_ecx.is_some())
+            .field("modify_host", &self.modify_host.is_some())
             .field("expected_return", &self.expected_return)
             .field("expected_stack", &self.expected_stack)
             .field("expected_memory", &MemDisplay(self.expected_memory))
@@ -165,6 +170,7 @@ impl<'a> TestCase<'a> {
             gas_limit: DEF_GAS_LIMIT,
             inspect_stack: None,
             modify_ecx: None,
+            modify_host: None,
             expected_return: RETURN_WHAT_INTERPRETER_SAYS,
             expected_stack: STACK_WHAT_INTERPRETER_SAYS,
             expected_memory: MEMORY_WHAT_INTERPRETER_SAYS,
@@ -236,6 +242,13 @@ pub fn def_codemap() -> &'static HashMap<Address, revm_bytecode::Bytecode> {
     })
 }
 
+/// A cold load the host refused because the caller passed `skip_cold_load = true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColdLoadKey {
+    Account(Address),
+    Slot(U256),
+}
+
 /// Test host that implements [`Host`] trait for testing.
 pub struct TestHost {
     pub storage: HashMap<U256, U256>,
@@ -244,6 +257,21 @@ pub struct TestHost {
     pub selfdestructs: Vec<(Address, Address)>,
     pub logs: Vec<Log>,
     pub gas_params: GasParams,
+    /// When set, the host models EIP-2929 warm/cold tracking like a real journal: the first
+    /// access to an account or storage slot is cold (`is_cold = true`), later accesses are warm,
+    /// and a cold access requested with `skip_cold_load = true` is refused with
+    /// [`LoadError::ColdLoadSkipped`] *without* being recorded as an access. Off by default so
+    /// existing tests keep their always-warm gas expectations.
+    pub cold_tracking: bool,
+    pub warm_accounts: HashSet<Address>,
+    pub warm_slots: HashSet<U256>,
+    /// Every account access the host actually served (`load_account_info_skip_cold_load` and
+    /// `selfdestruct`), with the `skip_cold_load` flag it was called with.
+    pub account_accesses: Vec<(Address, bool)>,
+    /// Every storage access the host actually served (`sload`/`sstore`), with the flag.
+    pub slot_accesses: Vec<(U256, bool)>,
+    /// Cold loads refused because the caller asked to skip them.
+    pub skipped_cold_loads: Vec<ColdLoadKey>,
 }
 
 impl Default for TestHost {
@@ -265,7 +293,43 @@ impl TestHost {
             selfdestructs: Vec::new(),
             logs: Vec::new(),
             gas_params: GasParams::new_spec(spec_id),
+            cold_tracking: false,
+            warm_accounts: HashSet::default(),
+            warm_slots: HashSet::default(),
+            account_accesses: Vec::new(),
+            slot_accesses: Vec::new(),
+            skipped_cold_loads: Vec::new(),
         }
+    }
+
+    /// Enables EIP-2929 warm/cold modeling; see [`Self::cold_tracking`].
+    pub fn enable_cold_tracking(&mut self) {
+        self.cold_tracking = true;
+    }
+
+    /// Returns `true` (cold) and warms the account, or refuses a cold access that the caller
+    /// wants skipped. Always warm when cold tracking is off.
+    fn touch_account(&mut self, address: Address, skip_cold_load: bool) -> Result<bool, LoadError> {
+        let is_cold = self.cold_tracking && !self.warm_accounts.contains(&address);
+        if is_cold && skip_cold_load {
+            self.skipped_cold_loads.push(ColdLoadKey::Account(address));
+            return Err(LoadError::ColdLoadSkipped);
+        }
+        self.warm_accounts.insert(address);
+        self.account_accesses.push((address, skip_cold_load));
+        Ok(is_cold)
+    }
+
+    /// Storage-slot counterpart of [`Self::touch_account`].
+    fn touch_slot(&mut self, key: U256, skip_cold_load: bool) -> Result<bool, LoadError> {
+        let is_cold = self.cold_tracking && !self.warm_slots.contains(&key);
+        if is_cold && skip_cold_load {
+            self.skipped_cold_loads.push(ColdLoadKey::Slot(key));
+            return Err(LoadError::ColdLoadSkipped);
+        }
+        self.warm_slots.insert(key);
+        self.slot_accesses.push((key, skip_cold_load));
+        Ok(is_cold)
     }
 }
 
@@ -344,8 +408,9 @@ impl Host for TestHost {
         &mut self,
         address: Address,
         target: Address,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<StateLoad<SelfDestructResult>, LoadError> {
+        let is_cold = self.touch_account(target, skip_cold_load)?;
         self.selfdestructs.push((address, target));
 
         Ok(StateLoad::new(
@@ -354,7 +419,7 @@ impl Host for TestHost {
                 target_exists: true,
                 previously_destroyed: false,
             },
-            false,
+            is_cold,
         ))
     }
 
@@ -374,10 +439,12 @@ impl Host for TestHost {
         &mut self,
         address: Address,
         load_code: bool,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<AccountInfoLoad<'_>, LoadError> {
         use revm_state::AccountInfo;
         use std::borrow::Cow;
+
+        let is_cold = self.touch_account(address, skip_cold_load)?;
 
         let code = if load_code {
             // Return actual code if found, otherwise empty bytecode
@@ -402,7 +469,7 @@ impl Host for TestHost {
 
         let is_empty = info.code.is_none() && info.balance.is_zero() && info.nonce == 0;
 
-        Ok(AccountInfoLoad { account: Cow::Owned(info), is_cold: false, is_empty })
+        Ok(AccountInfoLoad { account: Cow::Owned(info), is_cold, is_empty })
     }
 
     fn sstore_skip_cold_load(
@@ -410,13 +477,14 @@ impl Host for TestHost {
         _address: Address,
         key: U256,
         value: U256,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, LoadError> {
+        let is_cold = self.touch_slot(key, skip_cold_load)?;
         let original = self.storage.get(&key).copied().unwrap_or(U256::ZERO);
         self.storage.insert(key, value);
         Ok(StateLoad::new(
             SStoreResult { original_value: original, present_value: original, new_value: value },
-            false,
+            is_cold,
         ))
     }
 
@@ -424,16 +492,30 @@ impl Host for TestHost {
         &mut self,
         _address: Address,
         key: U256,
-        _skip_cold_load: bool,
+        skip_cold_load: bool,
     ) -> Result<StateLoad<U256>, LoadError> {
+        let is_cold = self.touch_slot(key, skip_cold_load)?;
         let value = self.storage.get(&key).copied().unwrap_or(U256::ZERO);
-        Ok(StateLoad::new(value, false))
+        Ok(StateLoad::new(value, is_cold))
     }
 }
 
 pub fn with_evm_context<F: FnOnce(&mut EvmContext<'_>, &mut EvmStack, &mut usize) -> R, R>(
     bytecode: &[u8],
     spec_id: SpecId,
+    f: F,
+) -> R {
+    with_evm_context_and_host(bytecode, spec_id, None, f)
+}
+
+/// [`with_evm_context`] with a hook applied to the freshly created [`TestHost`].
+pub fn with_evm_context_and_host<
+    F: FnOnce(&mut EvmContext<'_>, &mut EvmStack, &mut usize) -> R,
+    R,
+>(
+    bytecode: &[u8],
+    spec_id: SpecId,
+    modify_host: Option<fn(&mut TestHost)>,
     f: F,
 ) -> R {
     let input = InputsImpl {
@@ -451,6 +533,9 @@ pub fn with_evm_context<F: FnOnce(&mut EvmContext<'_>, &mut EvmStack, &mut usize
         Interpreter::new(SharedMemory::new(), ext_bytecode, input, false, spec_id, DEF_GAS_LIMIT);
 
     let mut host = TestHost::with_spec(spec_id);
+    if let Some(modify_host) = modify_host {
+        modify_host(&mut host);
+    }
 
     let (mut ecx, stack, stack_len) =
         EvmContext::from_interpreter_with_stack(&mut interpreter, &mut host);
@@ -484,6 +569,7 @@ fn run_compiled_test_case(test_case: &TestCase<'_>, f: EvmCompilerFn) {
         gas_limit,
         inspect_stack: _,
         modify_ecx,
+        modify_host,
         expected_return,
         expected_stack,
         expected_memory,
@@ -493,7 +579,7 @@ fn run_compiled_test_case(test_case: &TestCase<'_>, f: EvmCompilerFn) {
         assert_ecx,
     } = *test_case;
 
-    with_evm_context(bytecode, spec_id, |ecx, stack, stack_len| {
+    with_evm_context_and_host(bytecode, spec_id, modify_host, |ecx, stack, stack_len| {
         if is_static {
             ecx.is_static = true;
         }
@@ -527,6 +613,9 @@ fn run_compiled_test_case(test_case: &TestCase<'_>, f: EvmCompilerFn) {
         let table = instruction_table::<revm_interpreter::interpreter::EthInterpreter, TestHost>();
         let gas_table = gas_table_spec(spec_id);
         let mut int_host = TestHost::with_spec(spec_id);
+        if let Some(modify_host) = modify_host {
+            modify_host(&mut int_host);
+        }
         let interpreter_action = interpreter.run_plain(&table, &gas_table, &mut int_host);
 
         let int_result = match &interpreter_action {

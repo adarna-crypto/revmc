@@ -6,6 +6,8 @@ use revm_primitives::U256;
 /// A gas section tracks the total base gas cost of a sequence of instructions.
 ///
 /// Gas sections end at instructions that require `gasleft` (e.g. `GAS`, `SSTORE`),
+/// instructions with an EIP-2929 cold/warm access whose builtin compares `gasleft` against the
+/// cold surcharge (`BALANCE`, `EXTCODESIZE`, `EXTCODECOPY`, `EXTCODEHASH`, `SLOAD`, Berlin+),
 /// branching instructions, or suspending instructions.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GasSection {
@@ -235,9 +237,16 @@ impl SectionsAnalysis {
             self.gas.process_extra(bytecode.gas_params.exp_cost(exponent));
         }
 
-        // Dynamic-gas, branching, and suspending instructions end both sections.
+        // Dynamic-gas, cold-access, branching, and suspending instructions end both sections.
+        // Cold-access instructions must end the section so that their builtin observes exactly
+        // the same `gasleft()` as the interpreter at the skip-cold-load decision; see
+        // `InstData::has_cold_access`.
         let next = inst + 1;
-        if data.may_suspend() || data.is_branching() || data.requires_gasleft(bytecode.spec_id) {
+        if data.may_suspend()
+            || data.is_branching()
+            || data.requires_gasleft(bytecode.spec_id)
+            || data.has_cold_access(bytecode.spec_id)
+        {
             self.stack.save_to_reset(bytecode, next);
             self.gas.save_to_reset(bytecode, next);
         }
@@ -350,5 +359,115 @@ mod tests {
         );
         let dupn = bytecode.inst(Inst::from_usize(1));
         assert_eq!(dupn.stack_io(), (0, 0), "DUPN with invalid immediate must have zero stack I/O");
+    }
+
+    /// Static gas of `POP PUSH1 PUSH1 ADD POP STOP` = 2 + 3 + 3 + 3 + 2 + 0.
+    const TRAILING: u32 = 13;
+
+    /// `PUSH1 0x69, <op>, POP, PUSH1 1, PUSH1 2, ADD, POP, STOP` for single-input cold-access
+    /// opcodes.
+    fn cold_probe(opcode: u8) -> Vec<u8> {
+        vec![
+            op::PUSH1,
+            0x69,
+            opcode,
+            op::POP,
+            op::PUSH1,
+            1,
+            op::PUSH1,
+            2,
+            op::ADD,
+            op::POP,
+            op::STOP,
+        ]
+    }
+
+    /// Every EIP-2929 cold-access opcode ends the gas *and* stack section right after itself on
+    /// Berlin+ specs, so that the section head only pre-charges static gas up to and including
+    /// the opcode (3 for PUSH1 + 100 warm base) and the trailing instructions form their own
+    /// section. Without this the builtin would see `gasleft()` reduced by the trailing 13 gas at
+    /// its skip-cold-load decision and diverge from the interpreter.
+    #[test]
+    fn cold_access_opcodes_end_section_post_berlin() {
+        for opcode in [op::BALANCE, op::EXTCODESIZE, op::EXTCODEHASH, op::SLOAD] {
+            let bytecode = analyze_code_spec(cold_probe(opcode), SpecId::CANCUN);
+            let head = bytecode.inst(Inst::from_usize(0));
+            let cold = bytecode.inst(Inst::from_usize(1));
+            let after = bytecode.inst(Inst::from_usize(2));
+            assert!(cold.has_cold_access(SpecId::CANCUN), "{opcode:#x} must be a cold access");
+            assert_eq!(head.gas_section.gas_cost, 3 + 100, "{opcode:#x}: head section gas");
+            assert!(after.is_stack_section_head(), "{opcode:#x}: POP must start a new section");
+            assert_eq!(after.gas_section.gas_cost, TRAILING, "{opcode:#x}: trailing section gas");
+        }
+    }
+
+    /// `EXTCODECOPY` takes four stack inputs; the section still ends right after it.
+    #[test]
+    fn extcodecopy_ends_section_post_berlin() {
+        // PUSH0 PUSH0 PUSH0 PUSH1 0x69 EXTCODECOPY PUSH1 1 PUSH1 2 ADD POP STOP
+        let code = vec![
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH0,
+            op::PUSH1,
+            0x69,
+            op::EXTCODECOPY,
+            op::PUSH1,
+            1,
+            op::PUSH1,
+            2,
+            op::ADD,
+            op::POP,
+            op::STOP,
+        ];
+        let bytecode = analyze_code_spec(code, SpecId::CANCUN);
+        let head = bytecode.inst(Inst::from_usize(0));
+        let after = bytecode.inst(Inst::from_usize(5));
+        assert_eq!(head.gas_section.gas_cost, 2 + 2 + 2 + 3 + 100);
+        assert!(after.is_stack_section_head());
+        assert_eq!(after.gas_section.gas_cost, 3 + 3 + 3 + 2);
+    }
+
+    /// Before Berlin there is no cold/warm accounting and no skip decision, so the opcodes keep
+    /// folding into one section exactly as before (700 = Tangerine/Istanbul account access).
+    #[test]
+    fn cold_access_opcodes_do_not_end_section_pre_berlin() {
+        for (opcode, base) in [(op::BALANCE, 700), (op::EXTCODESIZE, 700), (op::EXTCODEHASH, 700)] {
+            let bytecode = analyze_code_spec(cold_probe(opcode), SpecId::ISTANBUL);
+            let head = bytecode.inst(Inst::from_usize(0));
+            let cold = bytecode.inst(Inst::from_usize(1));
+            let after = bytecode.inst(Inst::from_usize(2));
+            assert!(!cold.has_cold_access(SpecId::ISTANBUL));
+            assert_eq!(head.gas_section.gas_cost, 3 + base + TRAILING, "{opcode:#x}");
+            assert!(!after.is_stack_section_head(), "{opcode:#x}");
+        }
+    }
+
+    /// The predicate covers exactly the opcodes whose builtins implement the skip-cold-load
+    /// rule (including the two that already end sections for other reasons).
+    #[test]
+    fn has_cold_access_predicate_covers_skip_cold_load_builtins() {
+        let bytecode = analyze_code_spec(
+            vec![
+                op::BALANCE,
+                op::EXTCODESIZE,
+                op::EXTCODECOPY,
+                op::EXTCODEHASH,
+                op::SLOAD,
+                op::SSTORE,
+                op::SELFDESTRUCT,
+                op::CALL,
+                op::MLOAD,
+                op::GAS,
+            ],
+            SpecId::CANCUN,
+        );
+        let cold = |i: usize| bytecode.inst(Inst::from_usize(i)).has_cold_access(SpecId::CANCUN);
+        for i in 0..7 {
+            assert!(cold(i), "inst {i}");
+        }
+        for i in 7..10 {
+            assert!(!cold(i), "inst {i}");
+        }
     }
 }

@@ -1130,6 +1130,39 @@ impl InstData {
             || (self.opcode == op::SSTORE && spec_id.is_enabled_in(SpecId::ISTANBUL))
     }
 
+    /// Returns `true` if this instruction performs an EIP-2929 (Berlin+) warm/cold account or
+    /// storage access whose builtin decides between loading and *skipping* the cold load by
+    /// comparing `gasleft()` against the cold surcharge (`skip_cold_load = gas.remaining() <
+    /// cold_cost`; see `load_account`, `sload`, `sstore` and `selfdestruct` in `revmc-builtins`,
+    /// which mirror `revm_interpreter::instructions::host`).
+    ///
+    /// Such instructions must end the gas section. The interpreter charges each instruction's
+    /// static gas right before executing it, so at the skip decision it has paid exactly the
+    /// static gas up to and including this instruction. If the section continued past it, the
+    /// section head would also pre-charge the static gas of the instructions *after* it and the
+    /// builtin would observe less `gasleft()` than the interpreter. Whenever the remaining gas
+    /// lies in `[cold_cost, cold_cost + trailing_static_gas)` the builtin then skips the load
+    /// where the interpreter loads, pays the surcharge and only runs out of gas later: same
+    /// result and gas, but the host never sees the access (read cache / read set divergence).
+    ///
+    /// `SSTORE` already ends the section through [`Self::requires_gasleft`] and `SELFDESTRUCT`
+    /// through [`Self::is_diverging`]; they are listed here too so that this predicate is
+    /// complete on its own.
+    #[inline]
+    pub(crate) fn has_cold_access(&self, spec_id: SpecId) -> bool {
+        spec_id.is_enabled_in(SpecId::BERLIN)
+            && matches!(
+                self.opcode,
+                op::BALANCE
+                    | op::EXTCODESIZE
+                    | op::EXTCODECOPY
+                    | op::EXTCODEHASH
+                    | op::SLOAD
+                    | op::SSTORE
+                    | op::SELFDESTRUCT
+            )
+    }
+
     /// Returns `true` if execution can fall through to the next sequential instruction.
     #[inline]
     pub(crate) fn can_fall_through(&self) -> bool {
